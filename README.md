@@ -1,47 +1,92 @@
 # Orthogonal Multi-Head Attention Experiment
 
-This repository contains an experiment testing a structural constraint on the standard Transformer architecture: forcing attention heads to be orthogonal to maximize dimensional efficiency.
+A small character-level Transformer (Tiny Shakespeare) with a Gram-matrix penalty that pushes attention heads toward orthogonality. The question is whether disjoint heads use concatenated dimensions more efficiently and improve language-modeling loss.
 
-## The Hypothesis
+## Hypothesis
 
-![Cosine Similarity in vanilla transformer architecture](outputs_vanilla/block0_cosine_similarity.png)
-In a standard Transformer, the multi-head attention block computes multiple representations (heads) for the same token and then concatenates them to create a final representation. If you measure the cosine similarity between the outputs of these heads during a standard training run, they often sit between 30 and 90 degrees.
+In multi-head attention, several head outputs are concatenated into one residual-stream vector. If those heads are correlated, some of that width is redundant. The output projection can mix the redundancy away, so the model still trains, but you have paid for dimensions you did not use.
 
-Our hypothesis was that if the heads are highly correlated, we are essentially wasting dimensions. Because we are concatenating these vectors, any shared information could theoretically be represented in a lower-dimensional space. If we can force the heads to be closer to 90 degrees (orthogonal), the learned representation will be much richer because every head is forced to capture completely disjoint, non-redundant information.
+The claim: penalize off-diagonal cosine similarity between heads so they sit near 90°, and the extra width should become useful features rather than copies.
 
-## The Intuition
+On a vanilla concat model the heads are only mildly aligned. Mean absolute pairwise cosine is about **0.20** (~78°), not a pile of duplicate heads.
 
-Think about the dimension bottleneck. If we concatenate four 16-dimensional heads into a single 64-dimensional vector, but two of those heads are paying attention to the exact same features, we are paying the memory and compute cost of 64 dimensions while only utilizing the informational capacity of 48 dimensions.
+## What the first scripts did not test
 
-In a vanilla model, the output projection matrix usually cleans up this redundancy. It acts as a feature mixer that squashes redundant information down into a useful representation for the next layer. 
+`train.py`, `train_ortho_act.py`, and `train_ortho_wv.py` are the original notebooks-in-files. They are not a controlled comparison:
 
-Our intuition was to stop relying on the projection matrix to compensate for lazy, redundant feature learning. By penalizing high cosine similarity between head outputs during the forward pass, we wanted to force the network to be efficient by design.
+- `train_ortho_act.py` **summed** the four 16-d heads and projected `16 → 64`. Vanilla **concatenated** and projected `64 → 64`. Different mixer, different rank, different init RNG.
+- The \(W_v\) run used **2000** steps against **5000** for vanilla.
+- Flattening each `W_v` and orthogonalizing those matrices does not make per-token head activations orthogonal.
+- Eval batches shared the training RNG.
 
-## The Implementation
+The plots under `outputs_*` and `comparison_plots/` are from that first pass. Do not read them as the result of this repo.
 
-To enforce this, we implemented an orthogonal regularization loss using a Gram matrix penalty. 
+The matched experiment lives in `ortho_attn/` and was run on Kaggle from branch `kaggle/controlled-ortho`.
 
-By calculating the Gram matrix across the heads and penalizing the off-diagonal elements (using a soft margin to allow for slight natural variance), we pushed the cosine similarity of the heads toward zero. We experimented with applying this penalty to both the static Value projection weights and the dynamic per-token activations.
+## Controlled setup
 
-## The Results
+Same decoder for every variant: 4 layers, 4 heads, concat, then `Linear(n_embd, n_embd)` unless noted. Tiny Shakespeare, context 32, batch 64, AdamW `1e-3`, 5000 steps, seed 1337. Eval uses a separate generator so it does not steal training batches.
 
-![Consine Similarity b/w heads after training](outputs_ortho_act/block0_cosine_similarity.png)
-Mechanically, the Gram matrix loss worked exactly as intended. We successfully forced the attention heads to operate in orthogonal subspaces, and the cosine similarity between heads dropped significantly compared to the baseline runs.
+Penalty: mean ReLU(|cos| − margin) on off-diagonal Gram entries of L2-normalized head vectors, `margin = 0`, warm-up 500 steps.
 
-![train loss](comparison_plots/compare_train_loss.png)
+```text
+python -m pytest tests -q
+python -m ortho_attn.train --ortho none --output-dir runs/none
+python -m ortho_attn.train --ortho act  --output-dir runs/act
+python -m ortho_attn.train --ortho wv   --output-dir runs/wv
+```
 
-![val loss](comparison_plots/compare_val_loss.png)
-However, regarding the actual language modeling performance (training and validation loss), the results were almost identical to the vanilla model. 
+## Results
 
-We ran several ablation tests to see if this architectural constraint was useful under different conditions:
-* Running our standard baseline size.
-* Increasing the model size.
-* Decreasing the model size (to test if the orthogonal model handled parameter starvation better than the vanilla model).
+All numbers below are **val NLL** at step 4999, one seed. Pairs in a row are param-matched.
 
-At every test scale, the task loss of the orthogonal model practically mirrored the vanilla model. There were no massive drops in performance, but there were no significant improvements either.
+### Same architecture, extra loss only
+
+![val NLL](plots/controlled_val_loss.png)
+
+![pre-proj head cosine](plots/controlled_val_cosine.png)
+
+| Variant | Params | Val NLL | Mean \|cos\| (pre-proj) |
+|---|---|---|---|
+| none | 209729 | **1.707** | 0.205 |
+| act (λ=0.1) | 209729 | 1.708 | **0.075** |
+| Wv | 209729 | 1.705 | 0.203 |
+
+The activation penalty moves cosine. It does not move NLL. Orthogonalizing flattened `W_v` zeros that penalty and leaves **activation** cosine where vanilla is.
+
+### Follow-ups
+
+The original writeup said the output projection hides redundancy, and that a smaller model might need disjoint heads. Those two, plus a harder penalty:
+
+![follow-up val NLL](plots/followup_val_loss.png)
+
+![follow-up pre-proj cosine](plots/followup_val_cosine_pre.png)
+
+![follow-up post-proj cosine](plots/followup_val_cosine_post.png)
+
+| Setup | Params | Val NLL | Pre-proj \|cos\| | Post-proj \|cos\| |
+|---|---|---|---|---|
+| identity proj, none | 193089 | **1.713** | 0.197 | 0.197 |
+| identity proj, act | 193089 | 1.732 | 0.073 | 0.073 |
+| n_embd=32, none | 55745 | **1.892** | 0.291 | 0.305 |
+| n_embd=32, act | 55745 | 1.902 | 0.071 | 0.307 |
+| linear 64, act λ=1 | 209729 | 1.734 | **0.009** | 0.198 |
+
+- Dropping the output projection does not make orthogonality useful. Vanilla without `proj` is already 1.713; the penalty makes val **worse**.
+- Width 32 is just a worse language model for both. Vanilla heads get *more* correlated; forcing them apart still does not help NLL.
+- λ=1 drives pre-proj cosine to ~0.009 and NLL to 1.734 (slightly worse than 1.707).
+- With a linear `proj`, post-proj cosine stays ~0.20–0.31 even when pre-proj cosine is 0.07 or 0.009. The residual stream does not keep the orthogonal code.
 
 ## Takeaways
 
-This experiment highlighted a few realities about how Transformers optimize:
-1. **Capacity vs. Utility:** While we can successfully force the network to maximize its representational capacity, that capacity does not automatically equal utility. If the dataset does not require the full dimension space, the forced heads might just learn orthogonal noise rather than useful features.
-2. **The Value of Redundancy:** Deep learning models often use parameter redundancy to smooth out the loss landscape. By forcing strict orthogonality, we strip away the redundant pathways that help the optimizer easily navigate toward convergence.
+1. **The regularizer works.** You can make concatenated heads nearly orthogonal.
+2. **That capacity is not used as extra signal on this task.** Matched NLL is unchanged or a little worse.
+3. **The output projection remixes the heads.** Pre-proj orthogonality is not what the next layer sees.
+4. **Redundancy is not obviously the bottleneck** on Tiny Shakespeare, even without the mixer and even at 32-d.
+
+One seed, so ±0.01 is not a prize. Every matched pair points the same way.
+
+Kaggle jobs (clone this branch, do not inline the trainer):
+
+- https://www.kaggle.com/code/aivenger1st/controlled-ortho
+- https://www.kaggle.com/code/aivenger1st/controlled-ortho-followup
