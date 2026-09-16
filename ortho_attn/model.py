@@ -22,10 +22,13 @@ class GPTConfig:
     n_head: int = 4
     n_layer: int = 4
     dropout: float = 0.0
+    proj_mode: str = "linear"
 
     def __post_init__(self) -> None:
         if self.n_embd % self.n_head != 0:
             raise ValueError("n_embd must be divisible by n_head")
+        if self.proj_mode not in {"linear", "identity"}:
+            raise ValueError(f"unknown proj_mode: {self.proj_mode}")
 
     @property
     def head_size(self) -> int:
@@ -34,6 +37,14 @@ class GPTConfig:
 
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters())
+
+
+def heads_from_stream(x: torch.Tensor, n_head: int, head_size: int) -> torch.Tensor:
+    """(B, T, n_embd) -> (n_head, B, T, head_size)."""
+    b, t, c = x.shape
+    if c != n_head * head_size:
+        raise ValueError(f"stream width {c} != {n_head} * {head_size}")
+    return x.view(b, t, n_head, head_size).permute(2, 0, 1, 3).contiguous()
 
 
 class Head(nn.Module):
@@ -64,17 +75,24 @@ class Head(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
+        self.n_head = config.n_head
+        self.head_size = config.head_size
+        self.proj_mode = config.proj_mode
         self.heads = nn.ModuleList([Head(config) for _ in range(config.n_head)])
-        # Concat mixer: 4 * head_size == n_embd. Do not switch this to a sum.
-        self.proj = nn.Linear(config.n_embd, config.n_embd)
+        # Concat mixer: n_head * head_size == n_embd. Do not switch this to a sum.
+        if config.proj_mode == "linear":
+            self.proj = nn.Linear(config.n_embd, config.n_embd)
+        else:
+            self.proj = nn.Identity()
         self.dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         head_outputs = [h(x) for h in self.heads]
         stacked = torch.stack(head_outputs, dim=0)  # (n_head, B, T, head_size)
-        out = torch.cat(head_outputs, dim=-1)
-        out = self.dropout(self.proj(out))
-        return out, stacked
+        concat = torch.cat(head_outputs, dim=-1)
+        out = self.dropout(self.proj(concat))
+        post_proj = heads_from_stream(out, self.n_head, self.head_size)
+        return out, stacked, post_proj
 
 
 class FeedForward(nn.Module):
@@ -99,11 +117,11 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(config.n_embd)
         self.ln2 = nn.LayerNorm(config.n_embd)
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        sa_out, head_outputs = self.sa(self.ln1(x))
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        sa_out, head_outputs, post_proj = self.sa(self.ln1(x))
         x = x + sa_out
         x = x + self.ffwd(self.ln2(x))
-        return x, head_outputs
+        return x, head_outputs, post_proj
 
 
 class GPT(nn.Module):
@@ -124,13 +142,15 @@ class GPT(nn.Module):
             torch.arange(t, device=idx.device)
         )
         block_head_outputs: list[torch.Tensor] = []
+        block_post_proj: list[torch.Tensor] = []
         for block in self.blocks:
-            x, head_outputs = block(x)
+            x, head_outputs, post_proj = block(x)
             block_head_outputs.append(head_outputs)
+            block_post_proj.append(post_proj)
         x = self.ln_f(x)
         logits = self.lm_head(x)
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-        return logits, loss, block_head_outputs
+        return logits, loss, block_head_outputs, block_post_proj

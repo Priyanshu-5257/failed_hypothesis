@@ -1,0 +1,16 @@
+{
+  "id": "aivenger1st/controlled-ortho-followup",
+  "title": "controlled-ortho-followup",
+  "code_file": "controlled-ortho-followup.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": true,
+  "dataset_sources": [],
+  "kernel_sources": [],
+  "competition_sources": [],
+  "model_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}

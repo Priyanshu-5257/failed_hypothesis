@@ -73,13 +73,15 @@ def evaluate(
         losses = []
         orthos = []
         cosines = []
+        post_cosines = []
         for _ in range(eval_iters):
             x, y = get_batch(split_data, batch_size, block_size, device, generator=gen)
-            _logits, loss, heads = model(x, y)
+            _logits, loss, heads, post_proj = model(x, y)
             o = extra_loss(ortho, model, heads, margin)
             losses.append(loss.item())
             orthos.append(o.item())
             cosines.append(mean_abs_head_cosine(heads).item())
+            post_cosines.append(mean_abs_head_cosine(post_proj).item())
         mean_loss = sum(losses) / len(losses)
         mean_ortho = sum(orthos) / len(orthos)
         out[split_name] = {
@@ -87,6 +89,7 @@ def evaluate(
             "ortho_loss": mean_ortho,
             "total_loss": mean_loss + lambda_weight * mean_ortho,
             "mean_abs_head_cosine": sum(cosines) / len(cosines),
+            "mean_abs_head_cosine_post_proj": sum(post_cosines) / len(post_cosines),
         }
     model.train()
     return out
@@ -113,6 +116,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-embd", type=int, default=64)
     p.add_argument("--n-head", type=int, default=4)
     p.add_argument("--n-layer", type=int, default=4)
+    p.add_argument("--proj", choices=("linear", "identity"), default="linear")
     p.add_argument("--dropout", type=float, default=0.0)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--ortho-lambda", type=float, default=0.1)
@@ -140,16 +144,26 @@ def main() -> None:
         n_head=args.n_head,
         n_layer=args.n_layer,
         dropout=args.dropout,
+        proj_mode=args.proj,
     )
     model = GPT(config).to(device)
     n_params = count_parameters(model)
+    proj_mod = model.blocks[0].sa.proj
+    if args.proj == "linear":
+        if not isinstance(proj_mod, torch.nn.Linear):
+            raise RuntimeError("expected Linear output projection")
+        if proj_mod.in_features != args.n_embd or proj_mod.out_features != args.n_embd:
+            raise RuntimeError("concat mixer broken: proj is not n_embd -> n_embd")
+        proj_desc = f"{proj_mod.in_features}->{proj_mod.out_features}"
+    else:
+        if not isinstance(proj_mod, torch.nn.Identity):
+            raise RuntimeError("expected Identity output projection")
+        proj_desc = "identity"
     print(
         f"ortho={args.ortho} params={n_params} device={device} "
-        f"proj={model.blocks[0].sa.proj.in_features}->{model.blocks[0].sa.proj.out_features}",
+        f"n_embd={args.n_embd} proj={proj_desc} lambda={args.ortho_lambda}",
         flush=True,
     )
-    if model.blocks[0].sa.proj.in_features != args.n_embd:
-        raise RuntimeError("concat mixer broken: proj.in_features != n_embd")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -159,7 +173,8 @@ def main() -> None:
         "n_params": n_params,
         "vocab_size": data.vocab_size,
         "mixer": "concat",
-        "proj": [args.n_embd, args.n_embd],
+        "proj_mode": args.proj,
+        "proj": proj_desc,
     }
     (out_dir / "config.json").write_text(json.dumps(config_payload, indent=2))
 
@@ -191,12 +206,13 @@ def main() -> None:
                 f"step {step}: train {last_eval['train']['loss']:.4f} "
                 f"val {last_eval['val']['loss']:.4f} "
                 f"val_cos {last_eval['val']['mean_abs_head_cosine']:.4f} "
+                f"val_cos_post {last_eval['val']['mean_abs_head_cosine_post_proj']:.4f} "
                 f"val_ortho {last_eval['val']['ortho_loss']:.4f}",
                 flush=True,
             )
 
         xb, yb = get_batch(data.train, args.batch_size, args.block_size, device)
-        _logits, loss, heads = model(xb, yb)
+        _logits, loss, heads, _post = model(xb, yb)
         o = extra_loss(args.ortho, model, heads, args.ortho_margin)
         total = loss + lam * o
         optimizer.zero_grad(set_to_none=True)
@@ -226,12 +242,24 @@ def main() -> None:
     write_csv(
         out_dir / "eval_metrics.csv",
         eval_rows,
-        ["global_step", "split", "loss", "ortho_loss", "total_loss", "mean_abs_head_cosine"],
+        [
+            "global_step",
+            "split",
+            "loss",
+            "ortho_loss",
+            "total_loss",
+            "mean_abs_head_cosine",
+            "mean_abs_head_cosine_post_proj",
+        ],
     )
     summary = {
         "ok": True,
         "ortho": args.ortho,
         "n_params": n_params,
+        "n_embd": args.n_embd,
+        "n_head": args.n_head,
+        "proj_mode": args.proj,
+        "ortho_lambda": args.ortho_lambda,
         "seconds": elapsed,
         "final_eval": last_eval,
         "mixer": "concat",
